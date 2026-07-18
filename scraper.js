@@ -56,8 +56,33 @@ const limit =
 pLimit(CONFIG.concurrency);
 
 
-const sleep =
-ms => new Promise(r => setTimeout(r, ms));
+async function sleep(ms){
+
+    const step = 200;
+    let left = ms;
+
+    while(
+        left > 0
+    ){
+
+        if(
+            stopping
+        ){
+            return;
+        }
+
+        const chunk =
+        Math.min(step, left);
+
+        await new Promise(
+            r => setTimeout(r, chunk)
+        );
+
+        left -= chunk;
+
+    }
+
+}
 
 
 fs.ensureDirSync(
@@ -123,9 +148,87 @@ const stats = {
 };
 
 
+let stopping = false;
+
+let activeBar = null;
+
+let browserRef = null;
+
+
 // ==============================
 // UTILITAIRES
 // ==============================
+
+
+function saveIndex(){
+
+    fs.writeJsonSync(
+        CONFIG.indexFile,
+        index,
+        {
+            spaces: 2
+        }
+    );
+
+}
+
+
+
+function stopActiveBar(){
+
+    if(
+        !activeBar
+    ){
+        return;
+    }
+
+    try{
+
+        activeBar.stop();
+
+    }
+    catch(_){}
+
+    activeBar = null;
+
+}
+
+
+
+function isAbortError(err){
+
+    const msg =
+    String(err?.message || err || "");
+
+    return (
+        stopping
+        ||
+        /Target (page|context|browser) has been closed|browser has been closed|Connection closed|Protocol error/i
+        .test(msg)
+    );
+
+}
+
+
+
+function requestStop(signal){
+
+    if(
+        stopping
+    ){
+        return;
+    }
+
+    stopping = true;
+
+    stopActiveBar();
+
+    process.stdout.write(
+        `\n→ Arrêt demandé (${signal}), finalisation…\n`
+    );
+
+}
+
 
 
 function clean(text){
@@ -289,6 +392,8 @@ function makeBar(label, total){
 
     bar.start(Math.max(total, 1), 0, { status: "..." });
 
+    activeBar = bar;
+
     return bar;
 
 }
@@ -302,6 +407,12 @@ async function waitForCloudflare(page, label){
     while(
         Date.now() - start < CONFIG.cfWaitMs
     ){
+
+        if(
+            stopping
+        ){
+            throw new Error("arrêt demandé");
+        }
 
         const title =
         await page.title();
@@ -354,6 +465,13 @@ async function gotoSafe(page, url, label){
 
 
 async function download(url, file){
+
+
+    if(
+        stopping
+    ){
+        return false;
+    }
 
 
     if(
@@ -424,6 +542,13 @@ async function scrapeMusic(
 ){
 
 
+    if(
+        stopping
+    ){
+        return;
+    }
+
+
     const page =
     await context.newPage();
 
@@ -440,10 +565,22 @@ async function scrapeMusic(
             }
         );
 
+        if(
+            stopping
+        ){
+            return;
+        }
+
         await waitForCloudflare(page, "piste");
 
 
         await sleep(800);
+
+        if(
+            stopping
+        ){
+            return;
+        }
 
 
 
@@ -684,6 +821,12 @@ async function scrapeMusic(
         );
 
 
+        if(
+            stopping
+        ){
+            return;
+        }
+
 
         const sha =
         hashFile(file);
@@ -793,6 +936,16 @@ async function scrapeMusic(
     }
     catch(e){
 
+        if(
+            isAbortError(e)
+        ){
+            onDone?.(
+                "stop",
+                "arrêt"
+            );
+            return;
+        }
+
         stats.fail++;
         onDone?.(
             "err",
@@ -802,7 +955,12 @@ async function scrapeMusic(
     }
     finally{
 
-        await page.close();
+        try{
+
+            await page.close();
+
+        }
+        catch(_){}
 
     }
 
@@ -821,6 +979,13 @@ async function scrapePage(
     num,
     context
 ){
+
+
+    if(
+        stopping
+    ){
+        return;
+    }
 
 
     console.log(
@@ -842,6 +1007,13 @@ async function scrapePage(
         );
 
 
+        if(
+            stopping
+        ){
+            return;
+        }
+
+
         // laisse le listing se peupler
         await page.waitForSelector(
             "a[href*='/music/']",
@@ -850,6 +1022,12 @@ async function scrapePage(
 
         await sleep(1500);
 
+
+        if(
+            stopping
+        ){
+            return;
+        }
 
 
         const links =
@@ -914,6 +1092,12 @@ async function scrapePage(
             limit(
                 async () => {
 
+                    if(
+                        stopping
+                    ){
+                        return;
+                    }
+
                     await scrapeMusic(
                         link,
                         context,
@@ -938,7 +1122,14 @@ async function scrapePage(
 
         await Promise.all(tasks);
 
-        bar.stop();
+        stopActiveBar();
+
+
+        if(
+            stopping
+        ){
+            return;
+        }
 
 
         console.log(
@@ -949,6 +1140,12 @@ async function scrapePage(
     }
     catch(e){
 
+        if(
+            isAbortError(e)
+        ){
+            return;
+        }
+
         console.log(
             `✗ Page ${num} échouée:`,
             e.message
@@ -957,7 +1154,12 @@ async function scrapePage(
     }
     finally{
 
-        await page.close();
+        try{
+
+            await page.close();
+
+        }
+        catch(_){}
 
     }
 
@@ -969,6 +1171,17 @@ async function scrapePage(
 // ==============================
 // START
 // ==============================
+
+
+process.on(
+    "SIGINT",
+    () => requestStop("SIGINT")
+);
+
+process.on(
+    "SIGTERM",
+    () => requestStop("SIGTERM")
+);
 
 
 (async () => {
@@ -997,6 +1210,8 @@ await chromium.launch({
     ]
 
 });
+
+browserRef = browser;
 
 
 const context =
@@ -1029,16 +1244,31 @@ await context.addInitScript(() => {
 
 
 
+try{
+
 for(
 let i = 1;
 i <= CONFIG.pages;
 i++
 ){
 
+    if(
+        stopping
+    ){
+        break;
+    }
+
     await scrapePage(
         i,
         context
     );
+
+
+    if(
+        stopping
+    ){
+        break;
+    }
 
 
     console.log(
@@ -1062,10 +1292,55 @@ i++
 
 }
 
+}
+finally{
+
+    stopActiveBar();
+
+    try{
+
+        saveIndex();
+
+    }
+    catch(e){
+
+        console.error(
+            "Échec sauvegarde index:",
+            e.message
+        );
+
+    }
+
+    try{
+
+        await context.close();
+
+    }
+    catch(_){}
+
+    try{
+
+        await browser.close();
+
+    }
+    catch(_){}
+
+    browserRef = null;
+
+}
 
 
-await context.close();
-await browser.close();
+if(
+    stopping
+){
+
+    console.log(
+        `\nArrêt demandé — index sauvegardé (${index.total} pistes) | ok:${stats.ok} skip:${stats.skip} fail:${stats.fail}`
+    );
+
+    process.exit(0);
+
+}
 
 
 console.log(
@@ -1077,6 +1352,32 @@ console.log(
 
 
 })().catch(e => {
+
+    if(
+        isAbortError(e)
+    ){
+
+        stopActiveBar();
+
+        try{
+            saveIndex();
+        }
+        catch(_){}
+
+        if(
+            browserRef
+        ){
+            browserRef.close().catch(() => {});
+            browserRef = null;
+        }
+
+        console.log(
+            `\nArrêt demandé — index sauvegardé (${index.total} pistes) | ok:${stats.ok} skip:${stats.skip} fail:${stats.fail}`
+        );
+
+        process.exit(0);
+
+    }
 
     console.error(
         "Crash fatal:",
