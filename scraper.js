@@ -4,6 +4,7 @@ const fs = require("fs-extra");
 const path = require("path");
 const crypto = require("crypto");
 const pLimit = require("p-limit").default;
+const cliProgress = require("cli-progress");
 
 
 // ==============================
@@ -31,9 +32,17 @@ const CONFIG = {
     "musique-pixabay",
 
 
-    concurrency:3,
+    concurrency: 3,
 
-    delay:3000
+    delay: 3000,
+
+    // networkidle bloque souvent sur Pixabay (analytics/ads)
+    navTimeout: 45000,
+
+    // Chrome réel évite le challenge Cloudflare (Chromium Playwright = 403)
+    headless: true,
+
+    cfWaitMs: 45000
 
 };
 
@@ -48,7 +57,7 @@ pLimit(CONFIG.concurrency);
 
 
 const sleep =
-ms=>new Promise(r=>setTimeout(r,ms));
+ms => new Promise(r => setTimeout(r, ms));
 
 
 fs.ensureDirSync(
@@ -61,9 +70,9 @@ let index = {
     generated_at:
     new Date(),
 
-    total:0,
+    total: 0,
 
-    tracks:[]
+    tracks: []
 
 };
 
@@ -107,6 +116,12 @@ if(
 }
 
 
+const stats = {
+    ok: 0,
+    skip: 0,
+    fail: 0
+};
+
 
 // ==============================
 // UTILITAIRES
@@ -116,8 +131,8 @@ if(
 function clean(text){
 
     return text
-    ?.replace(/[<>:"\/\\|?*]/g,"")
-    .replace(/\s+/g,"-")
+    ?.replace(/[<>:"\/\\|?*]/g, "")
+    .replace(/\s+/g, "-")
     .toLowerCase()
     ||
     "unknown";
@@ -152,7 +167,7 @@ function categoryFromTags(tags){
     const categories = {
 
 
-        Cinematic:[
+        Cinematic: [
             "cinematic",
             "epic",
             "movie",
@@ -160,7 +175,7 @@ function categoryFromTags(tags){
         ],
 
 
-        Ambient:[
+        Ambient: [
             "ambient",
             "relax",
             "nature",
@@ -168,7 +183,7 @@ function categoryFromTags(tags){
         ],
 
 
-        Gaming:[
+        Gaming: [
             "game",
             "battle",
             "fantasy",
@@ -176,7 +191,7 @@ function categoryFromTags(tags){
         ],
 
 
-        Electronic:[
+        Electronic: [
             "electronic",
             "synth",
             "techno",
@@ -184,7 +199,7 @@ function categoryFromTags(tags){
         ],
 
 
-        Horror:[
+        Horror: [
             "dark",
             "horror",
             "scary"
@@ -201,7 +216,7 @@ function categoryFromTags(tags){
         if(
             categories[cat]
             .some(
-                x=>txt.includes(x)
+                x => txt.includes(x)
             )
         ){
 
@@ -218,17 +233,116 @@ function categoryFromTags(tags){
 
 
 
-
 function githubUrl(file){
 
 
     const relative =
     file
-    .replace("./library/","")
-    .replaceAll("\\","/");
+    .replace("./library/", "")
+    .replaceAll("\\", "/");
 
 
     return `https://raw.githubusercontent.com/${CONFIG.githubUser}/${CONFIG.githubRepo}/main/${relative}`;
+
+}
+
+
+
+function isTrackUrl(url){
+
+    try{
+
+        const u = new URL(url);
+
+        // /fr/music/titre-123456/  — pas /music/search/
+        return (
+            /\/music\/[^/]+-\d+\/?$/.test(u.pathname)
+            &&
+            !u.pathname.includes("/search/")
+        );
+
+    }
+    catch{
+
+        return false;
+
+    }
+
+}
+
+
+
+function makeBar(label, total){
+
+    const bar = new cliProgress.SingleBar(
+        {
+            format:
+            `${label} |{bar}| {percentage}% | {value}/{total} | {status}`,
+            barCompleteChar: "█",
+            barIncompleteChar: "░",
+            hideCursor: true,
+            clearOnComplete: false,
+            stopOnComplete: true
+        },
+        cliProgress.Presets.shades_classic
+    );
+
+    bar.start(Math.max(total, 1), 0, { status: "..." });
+
+    return bar;
+
+}
+
+
+
+async function waitForCloudflare(page, label){
+
+    const start = Date.now();
+
+    while(
+        Date.now() - start < CONFIG.cfWaitMs
+    ){
+
+        const title =
+        await page.title();
+
+        if(
+            !/just a moment|attention required|security verification/i
+            .test(title)
+        ){
+
+            return;
+        }
+
+        process.stdout.write(
+            `\r→ ${label}: challenge Cloudflare… ${Math.round((Date.now() - start) / 1000)}s   `
+        );
+
+        await sleep(1000);
+
+    }
+
+    throw new Error(
+        "Cloudflare non résolu (timeout)"
+    );
+
+}
+
+
+
+async function gotoSafe(page, url, label){
+
+    process.stdout.write(`\n→ ${label}: navigation...\n`);
+
+    await page.goto(
+        url,
+        {
+            waitUntil: "domcontentloaded",
+            timeout: CONFIG.navTimeout
+        }
+    );
+
+    await waitForCloudflare(page, label);
 
 }
 
@@ -239,14 +353,14 @@ function githubUrl(file){
 // ==============================
 
 
-async function download(url,file){
+async function download(url, file){
 
 
     if(
         fs.existsSync(file)
     ){
 
-        return;
+        return false;
 
     }
 
@@ -256,16 +370,18 @@ async function download(url,file){
 
         url,
 
-        method:"GET",
+        method: "GET",
 
-        responseType:"stream"
+        responseType: "stream",
+
+        timeout: 120000
 
     });
 
 
 
     await new Promise(
-    (resolve,reject)=>{
+    (resolve, reject) => {
 
 
         const stream =
@@ -290,6 +406,8 @@ async function download(url,file){
     });
 
 
+    return true;
+
 }
 
 
@@ -301,12 +419,13 @@ async function download(url,file){
 
 async function scrapeMusic(
     url,
-    browser
+    context,
+    onDone
 ){
 
 
     const page =
-    await browser.newPage();
+    await context.newPage();
 
 
 
@@ -316,39 +435,176 @@ async function scrapeMusic(
         await page.goto(
             url,
             {
-                waitUntil:"networkidle",
-                timeout:60000
+                waitUntil: "domcontentloaded",
+                timeout: CONFIG.navTimeout
             }
         );
+
+        await waitForCloudflare(page, "piste");
+
+
+        await sleep(800);
 
 
 
         const data =
-        await page.evaluate(()=>{
+        await page.evaluate(() => {
 
 
-            const title =
-            document.querySelector("h1")
-            ?.innerText
-            ||
-            "unknown";
+            const html =
+            document.documentElement.outerHTML;
 
 
-            const audio =
-            document.querySelector("audio")
-            ?.src;
+            let audio = null;
+            let title = "unknown";
+
+
+            try{
+
+                const lds =
+                [...document.querySelectorAll(
+                    'script[type="application/ld+json"]'
+                )]
+                .map(
+                    s => {
+                        try{
+                            return JSON.parse(s.textContent);
+                        }
+                        catch{
+                            return null;
+                        }
+                    }
+                )
+                .filter(Boolean);
+
+
+                const audioObj =
+                lds.find(
+                    j =>
+                    j["@type"] === "AudioObject"
+                    ||
+                    j.contentUrl
+                );
+
+
+                if(
+                    audioObj
+                ){
+
+                    audio =
+                    audioObj.contentUrl
+                    ||
+                    null;
+
+                    if(
+                        audioObj.name
+                    ){
+
+                        title =
+                        String(audioObj.name)
+                        .replace(
+                            /\s*\|\s*Musique.*/i,
+                            ""
+                        )
+                        .trim();
+
+                    }
+
+                }
+
+            }
+            catch(_){}
+
+
+            if(
+                !audio
+            ){
+
+                audio =
+                html.match(
+                    /https?:\/\/cdn\.pixabay\.com\/download\/audio\/[^"'\\\s]+/
+                )?.[0]
+                ||
+                html.match(
+                    /https?:\/\/cdn\.pixabay\.com\/audio\/[^"'\\\s]+\.mp3[^"'\\\s]*/
+                )?.[0]
+                ||
+                document.querySelector("audio")
+                ?.src
+                ||
+                null;
+
+            }
+
+
+            if(
+                title === "unknown"
+            ){
+
+                title =
+                document.querySelector(
+                    'meta[property="og:title"]'
+                )
+                ?.content
+                ?.replace(
+                    /\s*\|\s*Musique.*/i,
+                    ""
+                )
+                .trim()
+                ||
+                document.title
+                ?.replace(
+                    /\s*\|\s*Musique.*$/i,
+                    ""
+                )
+                .replace(
+                    /\s*-\s*Pixabay.*$/i,
+                    ""
+                )
+                .trim()
+                ||
+                "unknown";
+
+            }
+
+
+            let filenameHint = null;
+
+            try{
+
+                if(
+                    audio
+                ){
+
+                    const u =
+                    new URL(audio);
+
+                    filenameHint =
+                    u.searchParams.get(
+                        "filename"
+                    );
+
+                }
+
+            }
+            catch(_){}
 
 
 
             const tags =
             [...document.querySelectorAll(
-                "a"
+                "a[href*='/music/search/']"
             )]
             .map(
-                x=>x.innerText
+                x => x.innerText.trim()
             )
             .filter(
-                x=>x.length
+                x =>
+                x
+                &&
+                x.length > 1
+                &&
+                x.length < 40
             );
 
 
@@ -358,6 +614,8 @@ async function scrapeMusic(
                 title,
 
                 audio,
+
+                filenameHint,
 
                 tags
 
@@ -372,6 +630,8 @@ async function scrapeMusic(
             !data.audio
         ){
 
+            stats.skip++;
+            onDone?.("skip", data.title);
             return;
 
         }
@@ -387,9 +647,12 @@ async function scrapeMusic(
 
         const filename =
         clean(
+            data.filenameHint
+            ?.replace(/\.mp3$/i, "")
+            ||
             data.title
         )
-        +".mp3";
+        + ".mp3";
 
 
 
@@ -414,6 +677,7 @@ async function scrapeMusic(
 
 
 
+        const downloaded =
         await download(
             data.audio,
             file
@@ -429,10 +693,12 @@ async function scrapeMusic(
         if(
             index.tracks
             .some(
-                t=>t.hash===sha
+                t => t.hash === sha || t.file?.sha256 === sha
             )
         ){
 
+            stats.skip++;
+            onDone?.("dup", data.title);
             return;
 
         }
@@ -441,7 +707,7 @@ async function scrapeMusic(
 
         const relative =
         file
-        .replace("./library/","");
+        .replace("./library/", "");
 
 
 
@@ -465,9 +731,9 @@ async function scrapeMusic(
             data.tags,
 
 
-            source:{
+            source: {
 
-                pixabay:url,
+                pixabay: url,
 
                 download:
                 data.audio
@@ -475,7 +741,7 @@ async function scrapeMusic(
             },
 
 
-            repository:{
+            repository: {
 
                 github:
                 githubUrl(file)
@@ -483,7 +749,7 @@ async function scrapeMusic(
             },
 
 
-            file:{
+            file: {
 
                 path:
                 relative,
@@ -511,13 +777,14 @@ async function scrapeMusic(
             CONFIG.indexFile,
             index,
             {
-                spaces:2
+                spaces: 2
             }
         );
 
 
-        console.log(
-            "OK",
+        stats.ok++;
+        onDone?.(
+            downloaded ? "ok" : "cached",
             data.title
         );
 
@@ -526,9 +793,10 @@ async function scrapeMusic(
     }
     catch(e){
 
-        console.log(
-            "Erreur",
-            url
+        stats.fail++;
+        onDone?.(
+            "err",
+            e.message?.slice(0, 60) || "erreur"
         );
 
     }
@@ -551,71 +819,145 @@ async function scrapeMusic(
 
 async function scrapePage(
     num,
-    browser
+    context
 ){
 
 
     console.log(
-        "PAGE",
-        num
+        `\n========== PAGE ${num}/${CONFIG.pages} ==========`
     );
 
 
     const page =
-    await browser.newPage();
+    await context.newPage();
 
 
 
-    await page.goto(
-        CONFIG.baseUrl+num,
-        {
-            waitUntil:"networkidle",
-            timeout:60000
+    try{
+
+        await gotoSafe(
+            page,
+            CONFIG.baseUrl + num,
+            `Page ${num}`
+        );
+
+
+        // laisse le listing se peupler
+        await page.waitForSelector(
+            "a[href*='/music/']",
+            { timeout: 20000 }
+        ).catch(() => null);
+
+        await sleep(1500);
+
+
+
+        const links =
+        await page.evaluate(() => {
+
+
+            return [
+                ...document.querySelectorAll(
+                    "a"
+                )
+            ]
+            .map(
+                a => a.href
+            )
+            .filter(
+                Boolean
+            );
+
+
+        });
+
+
+
+        const unique =
+        [...new Set(
+            links.filter(isTrackUrl)
+        )];
+
+
+        console.log(
+            `→ Page ${num}: ${unique.length} pistes trouvées (${links.length} liens bruts)`
+        );
+        console.log(
+            `→ Téléchargement (×${CONFIG.concurrency})…`
+        );
+
+
+        if(
+            unique.length === 0
+        ){
+
+            console.log(
+                `⚠ Page ${num}: aucune piste — Cloudflare ou page vide ?`
+            );
+            return;
+
         }
-    );
 
 
+        const bar =
+        makeBar(
+            `DL p${num}`,
+            unique.length
+        );
 
-    const links =
-    await page.evaluate(()=>{
+        let done = 0;
 
 
-        return [
-            ...document.querySelectorAll(
-                "a"
+        const tasks =
+        unique.map(
+            link =>
+            limit(
+                async () => {
+
+                    await scrapeMusic(
+                        link,
+                        context,
+                        (status, title) => {
+
+                            done++;
+                            bar.update(
+                                done,
+                                {
+                                    status:
+                                    `${status} ${String(title || "").slice(0, 28)}`
+                                }
+                            );
+
+                        }
+                    );
+
+                }
             )
-        ]
-        .map(
-            a=>a.href
-        )
-        .filter(
-            x=>x.includes("/music/")
+        );
+
+
+        await Promise.all(tasks);
+
+        bar.stop();
+
+
+        console.log(
+            `✓ Page ${num} terminée — ok:${stats.ok} skip:${stats.skip} fail:${stats.fail} | index:${index.total}`
         );
 
 
-    });
+    }
+    catch(e){
 
-
-
-    await page.close();
-
-
-
-    const unique =
-    [...new Set(links)];
-
-
-
-    for(
-        const link of unique
-    ){
-
-        await limit(
-            ()=>scrapeMusic(
-                link,
-                browser
-            )
+        console.log(
+            `✗ Page ${num} échouée:`,
+            e.message
         );
+
+    }
+    finally{
+
+        await page.close();
 
     }
 
@@ -629,46 +971,117 @@ async function scrapePage(
 // ==============================
 
 
-(async()=>{
+(async () => {
+
+
+console.log(
+    "Pixabay scraper — démarrage"
+);
+console.log(
+    `Pages: ${CONFIG.pages} | concurrence: ${CONFIG.concurrency} | délai: ${CONFIG.delay}ms | headless: ${CONFIG.headless}`
+);
+console.log(
+    `Index actuel: ${index.total} pistes`
+);
 
 
 const browser =
 await chromium.launch({
 
-    headless:true
+    headless: CONFIG.headless,
+
+    channel: "chrome",
+
+    args: [
+        "--disable-blink-features=AutomationControlled"
+    ]
+
+});
+
+
+const context =
+await browser.newContext({
+
+    userAgent:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+
+    locale: "fr-FR",
+
+    viewport: {
+        width: 1365,
+        height: 900
+    }
+
+});
+
+
+await context.addInitScript(() => {
+
+    Object.defineProperty(
+        navigator,
+        "webdriver",
+        {
+            get: () => undefined
+        }
+    );
 
 });
 
 
 
 for(
-let i=1;
-i<=CONFIG.pages;
+let i = 1;
+i <= CONFIG.pages;
 i++
 ){
 
     await scrapePage(
         i,
-        browser
+        context
     );
 
 
-    await sleep(
-        CONFIG.delay
+    console.log(
+        `Progression globale: ${i}/${CONFIG.pages} pages | ok:${stats.ok} skip:${stats.skip} fail:${stats.fail}`
     );
+
+
+    if(
+        i < CONFIG.pages
+    ){
+
+        process.stdout.write(
+            `\n… pause ${CONFIG.delay}ms avant page suivante\n`
+        );
+
+        await sleep(
+            CONFIG.delay
+        );
+
+    }
 
 }
 
 
 
+await context.close();
 await browser.close();
 
 
 console.log(
-    "TERMINE",
-    index.total,
-    "musiques"
+    "\n========== TERMINE =========="
+);
+console.log(
+    `${index.total} musiques indexées | ok:${stats.ok} skip:${stats.skip} fail:${stats.fail}`
 );
 
 
-})();
+})().catch(e => {
+
+    console.error(
+        "Crash fatal:",
+        e
+    );
+    process.exit(1);
+
+});
